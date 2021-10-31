@@ -1,7 +1,18 @@
 /*
- * Copyright (C) 2016+     AzerothCore <www.azerothcore.org>, released under GNU GPL v2 license, you may redistribute it and/or modify it under version 2 of the License, or (at your option), any later version.
- * Copyright (C) 2008-2016 TrinityCore <http://www.trinitycore.org/>
- * Copyright (C) 2005-2009 MaNGOS <http://getmangos.com/>
+ * This file is part of the AzerothCore Project. See AUTHORS file for Copyright information
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Affero General Public License as published by the
+ * Free Software Foundation; either version 3 of the License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "BattlegroundMgr.h"
@@ -20,7 +31,7 @@
 #include "InstanceScript.h"
 #include "Log.h"
 #include "LootMgr.h"
-#include "MapManager.h"
+#include "MapMgr.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "OutdoorPvPMgr.h"
@@ -159,7 +170,7 @@ CreatureBaseStats const* CreatureBaseStats::GetBaseStats(uint8 level, uint8 unit
 
 bool ForcedDespawnDelayEvent::Execute(uint64 /*e_time*/, uint32 /*p_time*/)
 {
-    m_owner.DespawnOrUnsummon();    // since we are here, we are not TempSummon as object type cannot change during runtime
+    m_owner.DespawnOrUnsummon(0s, m_respawnTimer);    // since we are here, we are not TempSummon as object type cannot change during runtime
     return true;
 }
 
@@ -228,6 +239,9 @@ void Creature::AddToWorld()
             GetVehicleKit()->Install();
 #ifdef ELUNA
         sEluna->OnAddToWorld(this);
+
+    if (IsGuardian() && ToTempSummon() && ToTempSummon()->GetSummonerGUID().IsPlayer())
+        sEluna->OnPetAddedToWorld(ToTempSummon()->GetSummonerUnit()->ToPlayer(), this);
 #endif
     }
 }
@@ -270,15 +284,21 @@ void Creature::DisappearAndDie()
 void Creature::SearchFormation()
 {
     if (IsSummon())
+    {
         return;
+    }
 
     ObjectGuid::LowType spawnId = GetSpawnId();
     if (!spawnId)
+    {
         return;
+    }
 
-    CreatureGroupInfoType::iterator frmdata = sFormationMgr->CreatureGroupMap.find(spawnId);
+    CreatureGroupInfoType::const_iterator frmdata = sFormationMgr->CreatureGroupMap.find(spawnId);
     if (frmdata != sFormationMgr->CreatureGroupMap.end())
-        sFormationMgr->AddCreatureToGroup(frmdata->second->leaderGUID, this);
+    {
+        sFormationMgr->AddCreatureToGroup(frmdata->second.leaderGUID, this);
+    }
 }
 
 void Creature::RemoveCorpse(bool setSpawnTime, bool skipVisibility)
@@ -1011,7 +1031,7 @@ bool Creature::Create(ObjectGuid::LowType guidlow, Map* map, uint32 phaseMask, u
     //! Need to be called after LoadCreaturesAddon - MOVEMENTFLAG_HOVER is set there
     m_positionZ += GetHoverHeight();
 
-    LastUsedScriptID = GetCreatureTemplate()->ScriptID;
+    LastUsedScriptID = GetScriptId();
 
     if (IsSpiritHealer() || IsSpiritGuide() || (GetCreatureTemplate()->flags_extra & CREATURE_FLAG_EXTRA_GHOST_VISIBILITY))
     {
@@ -1896,12 +1916,11 @@ void Creature::Respawn(bool force)
     UpdateObjectVisibility(false);
 }
 
-void Creature::ForcedDespawn(uint32 timeMSToDespawn)
+void Creature::ForcedDespawn(uint32 timeMSToDespawn, Seconds forceRespawnTimer)
 {
     if (timeMSToDespawn)
     {
-        ForcedDespawnDelayEvent* pEvent = new ForcedDespawnDelayEvent(*this);
-
+        ForcedDespawnDelayEvent* pEvent = new ForcedDespawnDelayEvent(*this, forceRespawnTimer);
         m_Events.AddEvent(pEvent, m_Events.CalculateTime(timeMSToDespawn));
         return;
     }
@@ -1911,14 +1930,50 @@ void Creature::ForcedDespawn(uint32 timeMSToDespawn)
 
     // Xinef: set new respawn time, ignore corpse decay time...
     RemoveCorpse(true);
+
+    if (forceRespawnTimer > Seconds::zero())
+    {
+        m_respawnTime = time(nullptr) + forceRespawnTimer.count();
+        m_respawnDelay = forceRespawnTimer.count();
+    }
 }
 
-void Creature::DespawnOrUnsummon(uint32 msTimeToDespawn /*= 0*/)
+void Creature::DespawnOrUnsummon(Milliseconds msTimeToDespawn /*= 0*/, Seconds forcedRespawnTimer)
 {
     if (TempSummon* summon = this->ToTempSummon())
-        summon->UnSummon(msTimeToDespawn);
+        summon->UnSummon(msTimeToDespawn.count());
     else
-        ForcedDespawn(msTimeToDespawn);
+        ForcedDespawn(msTimeToDespawn.count(), forcedRespawnTimer);
+}
+
+void Creature::DespawnOnEvade()
+{
+    SetVisible(false);
+    AI()->SummonedCreatureDespawnAll();
+    RemoveEvadeAuras();
+
+    float x, y, z, o;
+    GetRespawnPosition(x, y, z, &o);
+    SetHomePosition(x, y, z, o);
+    SetPosition(x, y, z, o);
+
+    if (IsFalling())
+    {
+        RemoveUnitMovementFlag(MOVEMENTFLAG_FALLING);
+    }
+    StopMoving();
+}
+
+void Creature::RespawnOnEvade()
+{
+    SetVisible(true);
+    UpdateMovementFlags();
+    AI()->Reset();
+    AI()->JustReachedHome();
+    if (IsVehicle()) // use the same sequence of addtoworld, aireset may remove all summons!
+    {
+        GetVehicleKit()->Reset(true);
+    }
 }
 
 void Creature::InitializeReactState()
@@ -2142,9 +2197,14 @@ void Creature::SendAIReaction(AiReaction reactionType)
     LOG_DEBUG("network", "WORLD: Sent SMSG_AI_REACTION, type %u.", reactionType);
 }
 
-void Creature::CallAssistance()
+void Creature::CallAssistance(Unit* target /*= nullptr*/)
 {
-    if (!m_AlreadyCallAssistance && GetVictim() && !IsPet() && !IsCharmed())
+    if (!target)
+    {
+        target = GetVictim();
+    }
+
+    if (!m_AlreadyCallAssistance && target && !IsPet() && !IsCharmed())
     {
         SetNoCallAssistance(true);
 
@@ -2154,13 +2214,13 @@ void Creature::CallAssistance()
         {
             std::list<Creature*> assistList;
 
-            Acore::AnyAssistCreatureInRangeCheck u_check(this, GetVictim(), radius);
+            Acore::AnyAssistCreatureInRangeCheck u_check(this, target, radius);
             Acore::CreatureListSearcher<Acore::AnyAssistCreatureInRangeCheck> searcher(this, assistList, u_check);
             Cell::VisitGridObjects(this, searcher, radius);
 
             if (!assistList.empty())
             {
-                AssistDelayEvent* e = new AssistDelayEvent(GetVictim()->GetGUID(), this);
+                AssistDelayEvent* e = new AssistDelayEvent(target->GetGUID(), this);
                 while (!assistList.empty())
                 {
                     // Pushing guids because in delay can happen some creature gets despawned => invalid pointer
@@ -2547,9 +2607,12 @@ bool Creature::IsSpellProhibited(SpellSchoolMask idSchoolMask) const
     return false;
 }
 
-void Creature::_AddCreatureSpellCooldown(uint32 spell_id, uint32 end_time)
+void Creature::_AddCreatureSpellCooldown(uint32 spell_id, uint16 categoryId, uint32 end_time)
 {
-    m_CreatureSpellCooldowns[spell_id] = World::GetGameTimeMS() + end_time;
+    CreatureSpellCooldown spellCooldown;
+    spellCooldown.category = categoryId;
+    spellCooldown.end = World::GetGameTimeMS() + end_time;
+    m_CreatureSpellCooldowns[spell_id] = std::move(spellCooldown);
 }
 
 void Creature::AddSpellCooldown(uint32 spell_id, uint32 /*itemid*/, uint32 end_time, bool /*needSendToClient*/, bool /*forceSendToSpectator*/)
@@ -2561,33 +2624,31 @@ void Creature::AddSpellCooldown(uint32 spell_id, uint32 /*itemid*/, uint32 end_t
     // used in proc system, otherwise normal creature cooldown
     if (end_time)
     {
-        _AddCreatureSpellCooldown(spellInfo->Id, end_time);
+        _AddCreatureSpellCooldown(spellInfo->Id, 0, end_time);
         return;
     }
 
     uint32 spellcooldown = spellInfo->RecoveryTime;
-    uint32 categorycooldown = spellInfo->CategoryRecoveryTime;
-    if(Player* modOwner = GetSpellModOwner())
+    uint32 categoryId = spellInfo->GetCategory();
+    uint32 categorycooldown = categoryId ? spellInfo->CategoryRecoveryTime : 0;
+    if (Player* modOwner = GetSpellModOwner())
     {
         modOwner->ApplySpellMod(spellInfo->Id, SPELLMOD_COOLDOWN, spellcooldown);
         modOwner->ApplySpellMod(spellInfo->Id, SPELLMOD_COOLDOWN, categorycooldown);
     }
 
-    if (spellcooldown)
-        _AddCreatureSpellCooldown(spellInfo->Id, spellcooldown);
-
-    if (categorycooldown)
-        if (spellInfo->GetCategory())
+    SpellCategoryStore::const_iterator i_scstore = sSpellsByCategoryStore.find(categoryId);
+    if (categorycooldown && i_scstore != sSpellsByCategoryStore.end())
+    {
+        for (SpellCategorySet::const_iterator i_scset = i_scstore->second.begin(); i_scset != i_scstore->second.end(); ++i_scset)
         {
-            SpellCategoryStore::const_iterator i_scstore = sSpellsByCategoryStore.find(spellInfo->GetCategory());
-            if (i_scstore != sSpellsByCategoryStore.end())
-            {
-                uint32 cattime = categorycooldown;
-                for (SpellCategorySet::const_iterator i_scset = i_scstore->second.begin(); i_scset != i_scstore->second.end(); ++i_scset)
-                    if (GetSpellCooldown(*i_scset) < cattime)
-                        _AddCreatureSpellCooldown(*i_scset, cattime);
-            }
+            _AddCreatureSpellCooldown(i_scset->second, categoryId, categorycooldown);
         }
+    }
+    else if (spellcooldown)
+    {
+        _AddCreatureSpellCooldown(spellInfo->Id, 0, spellcooldown);
+    }
 }
 
 uint32 Creature::GetSpellCooldown(uint32 spell_id) const
@@ -2596,13 +2657,13 @@ uint32 Creature::GetSpellCooldown(uint32 spell_id) const
     if (itr == m_CreatureSpellCooldowns.end())
         return 0;
 
-    return itr->second > World::GetGameTimeMS() ? itr->second - World::GetGameTimeMS() : 0;
+    return itr->second.end > World::GetGameTimeMS() ? itr->second.end - World::GetGameTimeMS() : 0;
 }
 
 bool Creature::HasSpellCooldown(uint32 spell_id) const
 {
     CreatureSpellCooldowns::const_iterator itr = m_CreatureSpellCooldowns.find(spell_id);
-    return (itr != m_CreatureSpellCooldowns.end() && itr->second > World::GetGameTimeMS());
+    return (itr != m_CreatureSpellCooldowns.end() && itr->second.end > World::GetGameTimeMS());
 }
 
 bool Creature::HasSpell(uint32 spellID) const
@@ -2713,6 +2774,9 @@ std::string Creature::GetScriptName() const
 
 uint32 Creature::GetScriptId() const
 {
+    if (CreatureData const* creatureData = GetCreatureData())
+        return creatureData->ScriptId;
+
     return sObjectMgr->GetCreatureTemplate(GetEntry())->ScriptID;
 }
 
